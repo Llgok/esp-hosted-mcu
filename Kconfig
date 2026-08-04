@@ -10,6 +10,14 @@ config ESP_HOSTED_ENABLED
 menu "ESP-Hosted config"
 	depends on ESP_HOSTED_ENABLED
 
+	config ESP_HOSTED_AUTO_INIT
+		bool "Initialize ESP-Hosted automatically"
+		default y
+		help
+			Initialize ESP-Hosted from a constructor. Disable this option when
+			the application must register transport callbacks before calling
+			esp_hosted_init().
+
 	choice ESP_HOSTED_CP_TARGET
 		bool "Choose the Co-processor to use"
 

@@ -103,8 +103,11 @@ if(CONFIG_ESP_HOSTED_ENABLED)
 	# port files
 	list(APPEND priv_include "${host_dir}/port/esp/freertos/include")
 
+	if(CONFIG_ESP_HOSTED_AUTO_INIT)
+		list(APPEND srcs "${host_dir}/port/esp/freertos/src/port_esp_hosted_host_init.c")
+	endif()
+
 	list(APPEND srcs
-		"${host_dir}/port/esp/freertos/src/port_esp_hosted_host_init.c"
 		"${host_dir}/port/esp/freertos/src/port_esp_hosted_host_os.c"
 		#"${host_dir}/port/esp/freertos/src/port_esp_hosted_host_ota.c"
 		"${host_dir}/port/esp/freertos/src/port_esp_hosted_host_transport_defaults.c"

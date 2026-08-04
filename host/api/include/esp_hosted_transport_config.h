@@ -7,6 +7,10 @@
 #ifndef __ESP_HOSTED_TRANSPORT_CONFIG_H__
 #define __ESP_HOSTED_TRANSPORT_CONFIG_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdbool.h>
 
 #include "esp_err.h"
@@ -17,6 +21,9 @@ typedef enum {
 	ESP_TRANSPORT_ERR_ALREADY_SET = ESP_ERR_NOT_ALLOWED,
 	ESP_TRANSPORT_ERR_INVALID_STATE = ESP_ERR_INVALID_STATE,
 } esp_hosted_transport_err_t;
+
+/* Function pointer type for externally controlled SDIO reset signals */
+typedef esp_err_t (*esp_hosted_sdio_reset_fn_t)(void *arg, bool level);
 
 /* GPIO pin configuration structure */
 typedef struct {
@@ -150,6 +157,10 @@ bool esp_hosted_transport_is_config_valid(void);
 /* SDIO functions */
 esp_hosted_transport_err_t esp_hosted_sdio_get_config(struct esp_hosted_sdio_config **config);
 esp_hosted_transport_err_t esp_hosted_sdio_set_config(struct esp_hosted_sdio_config *config) __attribute__((warn_unused_result));
+esp_hosted_transport_err_t esp_hosted_sdio_set_reset_callback(
+		esp_hosted_sdio_reset_fn_t reset_fn, void *arg);
+esp_hosted_transport_err_t esp_hosted_sdio_get_reset_callback(
+		esp_hosted_sdio_reset_fn_t *reset_fn, void **arg);
 
 esp_hosted_transport_err_t esp_hosted_sdio_iomux_set_config(struct esp_hosted_sdio_config *config) __attribute__((warn_unused_result));
 
@@ -167,5 +178,9 @@ esp_hosted_transport_err_t esp_hosted_spi_set_config(struct esp_hosted_spi_confi
 /* UART functions */
 esp_hosted_transport_err_t esp_hosted_uart_get_config(struct esp_hosted_uart_config **config);
 esp_hosted_transport_err_t esp_hosted_uart_set_config(struct esp_hosted_uart_config *config) __attribute__((warn_unused_result));
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __ESP_HOSTED_TRANSPORT_CONFIG_H__ */

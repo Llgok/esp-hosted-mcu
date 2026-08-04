@@ -1509,14 +1509,57 @@ static esp_err_t transport_card_init(void *bus_handle, uint32_t timeout_ms)
 	return res;
 }
 
-static esp_err_t transport_gpio_reset(void *bus_handle, gpio_pin_t reset_pin)
+static esp_err_t transport_set_reset_level(gpio_pin_t reset_pin,
+		esp_hosted_sdio_reset_fn_t reset_fn, void *arg, bool level)
 {
-	g_h.funcs->_h_config_gpio(reset_pin.port, reset_pin.pin, H_GPIO_MODE_DEF_OUTPUT);
-	g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, H_RESET_VAL_ACTIVE);
+	if (reset_fn) {
+		return reset_fn(arg, level);
+	}
+
+	return g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, level);
+}
+
+static esp_err_t transport_slave_reset(gpio_pin_t reset_pin)
+{
+	esp_hosted_sdio_reset_fn_t reset_fn = NULL;
+	void *reset_fn_arg = NULL;
+	esp_err_t ret = ESP_OK;
+
+	if (ESP_TRANSPORT_OK != esp_hosted_sdio_get_reset_callback(
+			&reset_fn, &reset_fn_arg)) {
+		return ESP_FAIL;
+	}
+
+	if (!reset_fn) {
+		if (reset_pin.pin < 0) {
+			ESP_LOGE(TAG, "RESET pin is not configured");
+			return ESP_ERR_INVALID_ARG;
+		}
+		ret = g_h.funcs->_h_config_gpio(reset_pin.port, reset_pin.pin, H_GPIO_MODE_DEF_OUTPUT);
+		if (ret != ESP_OK) {
+			return ret;
+		}
+	}
+
+	ret = transport_set_reset_level(reset_pin, reset_fn, reset_fn_arg,
+			H_RESET_VAL_ACTIVE != 0);
+	if (ret != ESP_OK) {
+		return ret;
+	}
 	g_h.funcs->_h_msleep(10);
-	g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, H_RESET_VAL_INACTIVE);
+
+	ret = transport_set_reset_level(reset_pin, reset_fn, reset_fn_arg,
+			H_RESET_VAL_INACTIVE != 0);
+	if (ret != ESP_OK) {
+		return ret;
+	}
 	g_h.funcs->_h_msleep(10);
-	g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, H_RESET_VAL_ACTIVE);
+
+	ret = transport_set_reset_level(reset_pin, reset_fn, reset_fn_arg,
+			H_RESET_VAL_ACTIVE != 0);
+	if (ret != ESP_OK) {
+		return ret;
+	}
 	g_h.funcs->_h_msleep(H_HOST_SDIO_RESET_DELAY_MS);
 	return ESP_OK;
 }
@@ -1532,8 +1575,6 @@ int ensure_slave_bus_ready(void *bus_handle)
 		ESP_LOGE(TAG, "Unable to get RESET config for transport");
 		return -1;
 	}
-
-	assert(reset_pin.pin != -1);
 
 	release_slave_reset_gpio_post_wakeup();
 
@@ -1552,7 +1593,11 @@ int ensure_slave_bus_ready(void *bus_handle)
 		/* Give a chance to reset and recover the slave */
 		if (res) {
 			ESP_LOGI(TAG, "Attempt slave reset");
-			transport_gpio_reset(bus_handle, reset_pin);
+			res = transport_slave_reset(reset_pin);
+			if (res != ESP_OK) {
+				ESP_LOGE(TAG, "slave reset failed");
+				return res;
+			}
 		}
 
 		res = transport_card_init(bus_handle, CARD_INIT_TIMEOUT_MS);
@@ -1588,8 +1633,12 @@ int ensure_slave_bus_ready(void *bus_handle)
 		}
 	} else {
 		/* Always reset slave on host boot up */
-		ESP_LOGW(TAG, "Reset slave using GPIO[%u]", reset_pin.pin);
-		transport_gpio_reset(bus_handle, reset_pin);
+		ESP_LOGW(TAG, "Reset slave");
+		res = transport_slave_reset(reset_pin);
+		if (res != ESP_OK) {
+			ESP_LOGE(TAG, "slave reset failed");
+			return res;
+		}
 
 		res = transport_card_init(bus_handle, CARD_INIT_TIMEOUT_MS);
 		if (res) {

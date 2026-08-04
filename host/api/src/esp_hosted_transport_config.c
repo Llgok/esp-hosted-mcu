@@ -14,6 +14,8 @@ static const char *TAG = "esp_hosted_transport_config";
 
 /* Static configurations */
 static struct esp_hosted_transport_config s_transport_config = { 0 };
+static esp_hosted_sdio_reset_fn_t s_reset_fn;
+static void *s_reset_fn_arg;
 
 /* Flags to track if configs were set */
 static bool esp_hosted_transport_config_set;
@@ -89,6 +91,26 @@ esp_hosted_transport_err_t esp_hosted_transport_get_reset_config(gpio_pin_t *pin
 		break;
 	}
 
+	return ESP_TRANSPORT_OK;
+}
+
+esp_hosted_transport_err_t esp_hosted_sdio_set_reset_callback(
+		esp_hosted_sdio_reset_fn_t reset_fn, void *arg)
+{
+	s_reset_fn = reset_fn;
+	s_reset_fn_arg = arg;
+	return ESP_TRANSPORT_OK;
+}
+
+esp_hosted_transport_err_t esp_hosted_sdio_get_reset_callback(
+		esp_hosted_sdio_reset_fn_t *reset_fn, void **arg)
+{
+	if (!reset_fn || !arg) {
+		return ESP_TRANSPORT_ERR_INVALID_ARG;
+	}
+
+	*reset_fn = s_reset_fn;
+	*arg = s_reset_fn_arg;
 	return ESP_TRANSPORT_OK;
 }
 
