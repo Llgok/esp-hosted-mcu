@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "esp_idf_version.h"
 #include "driver/sdmmc_defs.h"
 #include "driver/sdmmc_host.h"
 
@@ -303,7 +304,21 @@ int hosted_sdio_deinit(void* ctx)
 		sdio_bus_lock = NULL;
 	}
 
-	sdmmc_host_deinit();
+	// 自定义修复开始：最新版已修复此问题，当前继续使用旧版本。
+	// 后续合并新版时删除此范围，改用上游实现。
+	esp_err_t result;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+	result = sdmmc_host_deinit_slot(context->config.slot);
+#else
+	// ESP-IDF 5.4 开始支持按插槽释放，旧版本只能释放整个控制器。
+	result = sdmmc_host_deinit();
+#endif
+	if (result != ESP_OK) {
+		ESP_LOGE(TAG, "Failed to deinitialize SDMMC host resources: %s",
+			esp_err_to_name(result));
+		return result;
+	}
+	// 自定义修复结束。
 
 	return ESP_OK;
 }
