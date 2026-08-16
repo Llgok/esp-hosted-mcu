@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdio.h>
+
 #include "esp_idf_version.h"
 #include "driver/sdmmc_defs.h"
 #include "driver/sdmmc_host.h"
@@ -426,21 +428,31 @@ int hosted_sdio_card_init(void *ctx, bool show_config)
 
 	config.max_freq_khz = sdio_config->clock_freq_khz;
 	if (show_config) {
+		esp_hosted_sdio_reset_fn_t reset_fn = NULL;
+		void *reset_fn_arg = NULL;
+		char reset_source[16] = { 0 };
+		if (esp_hosted_sdio_get_reset_callback(&reset_fn, &reset_fn_arg) ==
+				ESP_TRANSPORT_OK && reset_fn != NULL) {
+			snprintf(reset_source, sizeof(reset_source), "callback");
+		} else {
+			snprintf(reset_source, sizeof(reset_source), "%u",
+					(unsigned int)sdio_config->pin_reset.pin);
+		}
 		ESP_LOGI(TAG, "SDIO master: Slot %d, Data-Lines: %d-bit Freq(KHz)[%u KHz]",
 				config.slot,
 				sdio_config->bus_width==4? 4:1,
 				config.max_freq_khz);
 		if (sdio_config->bus_width == 4) {
-			ESP_LOGI(TAG, "GPIOs: CLK[%u] CMD[%u] D0[%u] D1[%u] D2[%u] D3[%u] Slave_Reset[%u]",
+			ESP_LOGI(TAG, "GPIOs: CLK[%u] CMD[%u] D0[%u] D1[%u] D2[%u] D3[%u] Slave_Reset[%s]",
 					sdio_config->pin_clk.pin, sdio_config->pin_cmd.pin,
 					sdio_config->pin_d0.pin, sdio_config->pin_d1.pin,
 					sdio_config->pin_d2.pin, sdio_config->pin_d3.pin,
-					sdio_config->pin_reset.pin);
+					reset_source);
 		} else {
-			ESP_LOGI(TAG, "GPIOs: CLK[%u] CMD[%u] D0[%u] D1[%u] Slave_Reset[%u]",
+			ESP_LOGI(TAG, "GPIOs: CLK[%u] CMD[%u] D0[%u] D1[%u] Slave_Reset[%s]",
 					sdio_config->pin_clk.pin, sdio_config->pin_cmd.pin,
 					sdio_config->pin_d0.pin, sdio_config->pin_d1.pin,
-					sdio_config->pin_reset.pin);
+					reset_source);
 		}
 		ESP_LOGI(TAG, "Queues: Tx[%u] Rx[%u] SDIO-Rx-Mode[%u]",
 				sdio_config->tx_queue_size, sdio_config->rx_queue_size,
