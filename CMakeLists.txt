@@ -137,7 +137,7 @@ endif()
 list(APPEND driver_requires esp_event)
 
 idf_component_register(SRCS ${srcs}
-	PRIV_REQUIRES soc esp_netif esp_timer driver esp_wifi bt esp_http_client console wpa_supplicant
+	PRIV_REQUIRES soc esp_netif esp_timer driver esp_wifi bt esp_http_client console wpa_supplicant esp_mm
 	REQUIRES ${driver_requires}
 	INCLUDE_DIRS ${pub_include}
 	PRIV_INCLUDE_DIRS ${priv_include})

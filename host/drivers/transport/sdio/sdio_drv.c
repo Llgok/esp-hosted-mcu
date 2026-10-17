@@ -88,6 +88,9 @@
 #include "esp_hosted_bt.h"
 #include "port_esp_hosted_host_config.h"
 #include "esp_hosted_event.h"
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+#include "esp_heap_caps.h"
+#endif
 
 static const char TAG[] = "H_SDIO_DRV";
 
@@ -874,6 +877,26 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 	return ESP_OK;
 }
 #else // H_SDIO_HOST_STREAMING_MODE
+/**
+ * @brief 为 SDIO 流式接收分配对齐缓冲
+ * @details ESP32-P4 主控在仅块传输模式下优先使用缓存对齐的外部内存，
+ *          分配返回空指针时回退到原有分配接口；其他主控或传输模式保持原有分配方式。
+ *          此处判断的是主控型号，不限制所连接的无线协处理器型号。
+ * @param len 接收缓冲长度
+ * @return 分配成功返回缓冲地址，否则返回空指针
+ */
+static uint8_t *sdio_rx_stream_alloc(uint32_t len)
+{
+#if defined(CONFIG_IDF_TARGET_ESP32P4) && H_SDIO_RX_BLOCK_ONLY_XFER
+	uint8_t *buffer = heap_caps_aligned_alloc(HOSTED_MEM_ALIGNMENT_64, len,
+			MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT | MALLOC_CAP_CACHE_ALIGNED);
+	if (buffer) {
+		return buffer;
+	}
+#endif
+	return (uint8_t *)g_h.funcs->_h_malloc_align(len, HOSTED_MEM_ALIGNMENT_64);
+}
+
 // SDIO streaming mode
 // return a buffer big enough to contain the data
 static uint8_t * sdio_rx_get_buffer(uint32_t len)
@@ -892,7 +915,7 @@ static uint8_t * sdio_rx_get_buffer(uint32_t len)
 			// free already allocated memory
 			g_h.funcs->_h_free_align(*buf);
 		}
-		*buf = (uint8_t *)g_h.funcs->_h_malloc_align(len, HOSTED_MEM_ALIGNMENT_64);
+		*buf = sdio_rx_stream_alloc(len);
 		assert(*buf);
 		double_buf.buffer[index].buf_size = len;
 		ESP_LOGD(TAG, "buf %d size: %ld", index, double_buf.buffer[index].buf_size);
