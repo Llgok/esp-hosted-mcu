@@ -121,6 +121,9 @@ static const char TAG[] = "H_SDIO_DRV";
 /* Actual data sdio_write max retry */
 #define MAX_SDIO_WRITE_RETRY              2
 
+// SDIO 接收缓冲暂时不足时的重试间隔
+#define SDIO_RX_ALLOC_RETRY_MS            1
+
 // this locks the sdio transaction at the driver level, instead of at the HAL layer
 #define USE_DRIVER_LOCK
 
@@ -173,6 +176,9 @@ static uint32_t sdio_tx_buf_count = 0;
 
 /* Counter to hold the amount of bytes already received from sdio slave */
 static uint32_t sdio_rx_byte_count = 0;
+
+// 合并接收内存池不足时的重复日志，避免网络高负载时刷屏。
+static bool mempool_oom_logged = false;
 
 // one-time trigger to start write thread
 static bool sdio_start_write_thread = false;
@@ -406,6 +412,19 @@ static int sdio_read_regs(uint8_t * buf)
 
 #if H_SDIO_HOST_RX_MODE != H_SDIO_ALWAYS_HOST_RX_MAX_TRANSPORT_SIZE
 
+/**
+ * @brief 按完整寄存器值识别 SDIO 总线故障，保留低 20 位全为一的合法累计长度
+ * @param reg_val 未屏蔽的接收长度寄存器
+ * @return 寄存器全部 32 位为一时返回 true
+ */
+static bool sdio_pkt_len_reg_is_bus_fault(uint32_t reg_val)
+{
+	if (reg_val != UINT32_MAX)
+		return false;
+	ESP_LOGE(TAG, "PKT_LEN register is 0xFFFFFFFF: SDIO bus fault");
+	return true;
+}
+
 #if DO_COMBINED_REG_READ
 // get the length from the provided register value
 static int sdio_get_len_from_slave(uint32_t *rx_size, uint32_t reg_val, bool is_lock_needed)
@@ -416,6 +435,9 @@ static int sdio_get_len_from_slave(uint32_t *rx_size, uint32_t reg_val, bool is_
 	if (!rx_size)
 		return ESP_FAIL;
 	*rx_size = 0;
+
+	if (sdio_pkt_len_reg_is_bus_fault(reg_val))
+		return ESP_ERR_INVALID_STATE;
 
 	len &= ESP_SLAVE_LEN_MASK;
 
@@ -458,6 +480,9 @@ static int sdio_get_len_from_slave(uint32_t *rx_size, bool is_lock_needed)
 		ESP_LOGE(TAG, "len read err: %d", ret);
 		return ret;
 	}
+
+	if (sdio_pkt_len_reg_is_bus_fault(len))
+		return ESP_ERR_INVALID_STATE;
 
 	len &= ESP_SLAVE_LEN_MASK;
 
@@ -820,7 +845,9 @@ static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t
 		return ESP_FAIL;
 	}
 
-	g_h.funcs->_h_queue_item(from_slave_queue[pkt_prio], &buf_handle, HOSTED_BLOCK_MAX);
+	if (g_h.funcs->_h_queue_item(from_slave_queue[pkt_prio], &buf_handle, HOSTED_BLOCK_MAX)) {
+		return ESP_FAIL;
+	}
 	g_h.funcs->_h_post_semaphore(sem_from_slave_queue);
 
 	return ESP_OK;
@@ -871,6 +898,7 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 
 	if (sdio_push_pkt_to_queue(buf, len, offset)) {
 		ESP_LOGE(TAG, "Failed to push Rx packet to queue");
+		sdio_rx_free_buffer(buf);
 		return ESP_FAIL;
 	}
 
@@ -878,12 +906,14 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 }
 #else // H_SDIO_HOST_STREAMING_MODE
 /**
- * @brief 为 SDIO 流式接收分配对齐缓冲
- * @details ESP32-P4 主控在仅块传输模式下优先使用缓存对齐的外部内存，
- *          分配返回空指针时回退到原有分配接口；其他主控或传输模式保持原有分配方式。
- *          此处判断的是主控型号，不限制所连接的无线协处理器型号。
+ * @brief 处理 SDIO 接收缓冲分配失败导致主控重启的问题
+ * @details 保留按主控型号和传输模式选择对齐内存的逻辑，并在内存暂时不足时保留旧缓冲、
+ *          返回空指针，由接收任务稍后重试；数据包内存不足时丢弃当前数据包，
+ *          避免使用硬断言终止主控。
  * @param len 接收缓冲长度
  * @return 分配成功返回缓冲地址，否则返回空指针
+ * @warning 后续升级到已包含同等内存不足处理的新版 ESP-Hosted 后，应删除这里新增的处理，
+ *          避免重复修改同一条接收路径。
  */
 static uint8_t *sdio_rx_stream_alloc(uint32_t len)
 {
@@ -911,12 +941,14 @@ static uint8_t * sdio_rx_get_buffer(uint32_t len)
 	uint8_t ** buf = &double_buf.buffer[index].buf;
 
 	if (len > double_buf.buffer[index].buf_size) {
+		uint8_t *new_buffer = sdio_rx_stream_alloc(len);
+		if (!new_buffer) {
+			return NULL;
+		}
 		if (*buf) {
-			// free already allocated memory
 			g_h.funcs->_h_free_align(*buf);
 		}
-		*buf = sdio_rx_stream_alloc(len);
-		assert(*buf);
+		*buf = new_buffer;
 		double_buf.buffer[index].buf_size = len;
 		ESP_LOGD(TAG, "buf %d size: %ld", index, double_buf.buffer[index].buf_size);
 	}
@@ -946,20 +978,33 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 			/* TODO: Free by caller? */
 			return ESP_FAIL;
 		}
-		/* Allocate rx buffer */
-		pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
-		assert(pkt_rxbuff);
-
 		packet_size = len + offset;
 		if (packet_size > buf_len) {
 			ESP_LOGE(TAG, "packet size[%lu]>[%lu] too big for remaining stream data",
 					packet_size, buf_len);
 			return ESP_FAIL;
 		}
+
+		/* Allocate rx buffer */
+		pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
+		if (!pkt_rxbuff) {
+			if (!mempool_oom_logged) {
+				ESP_LOGW(TAG, "SDIO RX buffer allocation failed; dropping packet");
+				mempool_oom_logged = true;
+			}
+			buf_len -= packet_size;
+			buf += packet_size;
+			continue;
+		}
+		if (mempool_oom_logged) {
+			ESP_LOGW(TAG, "SDIO RX buffer allocation recovered");
+			mempool_oom_logged = false;
+		}
 		memcpy(pkt_rxbuff, buf, packet_size);
 
 		if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset)) {
 			ESP_LOGI(TAG, "Failed to push a packet to queue from stream");
+			sdio_buffer_free(pkt_rxbuff);
 		}
 
 		// move to the next packet in the stream
@@ -982,19 +1027,20 @@ static void sdio_data_to_rx_buf_task(void const* pvParameters)
 	while (1) {
 		g_h.funcs->_h_get_semaphore(sem_double_buf_xfer_data, HOSTED_BLOCK_MAX);
 
-		if (double_buf.read_index < 0) {
+		const int read_index = __atomic_load_n(&double_buf.read_index, __ATOMIC_ACQUIRE);
+		if (read_index < 0) {
 			ESP_LOGE(TAG, "invalid double buf read_index");
 			continue;
 		}
 
-		buf = double_buf.buffer[double_buf.read_index].buf;
+		buf = double_buf.buffer[read_index].buf;
 		len = double_buf.read_data_len;
 
 		if (sdio_push_data_to_queue(buf, len))
 			ESP_LOGE(TAG, "Failed to push data to rx queue");
 
 		// finished sending data: reset read_index
-		double_buf.read_index = -1;
+		__atomic_store_n(&double_buf.read_index, -1, __ATOMIC_RELEASE);
 	}
 }
 
@@ -1051,6 +1097,7 @@ static void sdio_read_task(void const* pvParameters)
 	uint32_t len_to_read;
 	uint8_t *pos;
 	uint32_t interrupts;
+	bool pending = false;
 
 #if DO_COMBINED_REG_READ
 	uint32_t *intr_index = NULL;
@@ -1091,16 +1138,20 @@ static void sdio_read_task(void const* pvParameters)
 
 	for (;;) {
 
-		// wait for sdio interrupt from slave
-		/* call will block until there is an interrupt, timeout or error */
-		ESP_LOGD(TAG, "--- Wait for SDIO intr ---");
-		res = g_h.funcs->_h_sdio_wait_slave_intr(sdio_handle, HOSTED_BLOCK_MAX);
-		ESP_LOGD(TAG, "--- SDIO intr received ---");
+		const bool retry_pending = pending;
+		if (!pending) {
+			// wait for sdio interrupt from slave
+			/* call will block until there is an interrupt, timeout or error */
+			ESP_LOGD(TAG, "--- Wait for SDIO intr ---");
+			res = g_h.funcs->_h_sdio_wait_slave_intr(sdio_handle, HOSTED_BLOCK_MAX);
+			ESP_LOGD(TAG, "--- SDIO intr received ---");
 
-		if (res != ESP_OK) {
-			ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
-			continue;
+			if (res != ESP_OK) {
+				ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
+				continue;
+			}
 		}
+		pending = false;
 
 		SDIO_DRV_LOCK();
 
@@ -1148,7 +1199,8 @@ static void sdio_read_task(void const* pvParameters)
 		if (BIT(SDIO_INT_STOP_THROTTLE) & interrupts)
 			wifi_tx_throttling = 0;
 
-		if (!(BIT(SDIO_INT_NEW_PACKET) & interrupts)) {
+		// 中断已清除时，仍需根据从机未读字节数重试，不能等待另一个新中断。
+		if (!retry_pending && !(BIT(SDIO_INT_NEW_PACKET) & interrupts)) {
 
 			SDIO_DRV_UNLOCK();
 			continue;
@@ -1170,19 +1222,37 @@ static void sdio_read_task(void const* pvParameters)
 #else
 		ret = sdio_get_len_from_slave(&len_from_slave, ACQUIRE_LOCK);
 #endif
-		if (ret || !len_from_slave) {
-			ESP_LOGW(TAG, "invalid ret or len_from_slave: %d %ld", ret, len_from_slave);
-
+		if (ret == ESP_ERR_INVALID_STATE) {
+			SDIO_DRV_UNLOCK();
+			g_h.funcs->_h_event_post(ESP_HOSTED_EVENT,
+					ESP_HOSTED_EVENT_TRANSPORT_FAILURE,
+					NULL, 0, HOSTED_BLOCK_MAX);
+#if H_TRANSPORT_RESTART_ON_FAILURE
+			g_h.funcs->_h_restart_host();
+#endif
+			continue;
+		}
+		if (ret) {
+			ESP_LOGW(TAG, "Failed to get SDIO RX length: %d", ret);
 			SDIO_DRV_UNLOCK();
 			continue;
-		} else {
-			ESP_LOGD(TAG, "len_from_slave: %ld", len_from_slave);
 		}
+		// 主动排空接收数据后，长度为零表示本轮已读完，不是通信错误。
+		if (!len_from_slave) {
+			SDIO_DRV_UNLOCK();
+			continue;
+		}
+		ESP_LOGD(TAG, "len_from_slave: %ld", len_from_slave);
 #endif
 
 		/* Allocate rx buffer */
 		rxbuff = sdio_rx_get_buffer(len_from_slave);
-		assert(rxbuff);
+		if (!rxbuff) {
+			pending = true;
+			SDIO_DRV_UNLOCK();
+			g_h.funcs->_h_msleep(SDIO_RX_ALLOC_RETRY_MS);
+			continue;
+		}
 
 		data_left = len_from_slave;
 		pos = rxbuff;
@@ -1221,21 +1291,22 @@ static void sdio_read_task(void const* pvParameters)
 		sdio_rx_byte_count += len_from_slave;
 		sdio_rx_byte_count = sdio_rx_byte_count % ESP_RX_BYTE_MAX;
 
+#if H_SDIO_HOST_RX_MODE != H_SDIO_ALWAYS_HOST_RX_MAX_TRANSPORT_SIZE
+		pending = true;
+#endif
+
 		if (unlikely(ret))
 			continue;
 
-		if (double_buf.read_index < 0) {
-			double_buf.read_index = double_buf.write_index;
-			double_buf.read_data_len = len_from_slave;
-			double_buf.write_index = (double_buf.write_index) ? 0 : 1;
-			// trigger task to copy data to queue
-			g_h.funcs->_h_post_semaphore(sem_double_buf_xfer_data);
-		} else {
-			// error: task to copy data to queue still running
-			sdio_rx_free_buffer(rxbuff);
-			ESP_LOGE(TAG, "task still writing Rx data to queue!");
-			// don't send data to task, or update write_index
+		// 保留本次已读数据，等待上一缓冲入队，避免高负载时丢弃整块网络或 RPC 数据。
+		while (__atomic_load_n(&double_buf.read_index, __ATOMIC_ACQUIRE) >= 0) {
+			g_h.funcs->_h_msleep(SDIO_RX_ALLOC_RETRY_MS);
 		}
+		const int next_read_index = double_buf.write_index;
+		double_buf.read_data_len = len_from_slave;
+		double_buf.write_index = (double_buf.write_index) ? 0 : 1;
+		__atomic_store_n(&double_buf.read_index, next_read_index, __ATOMIC_RELEASE);
+		g_h.funcs->_h_post_semaphore(sem_double_buf_xfer_data);
 	}
 }
 
@@ -1280,7 +1351,11 @@ static void sdio_process_rx_task(void const* pvParameters)
 			if (chan_arr[buf_handle->if_type] && chan_arr[buf_handle->if_type]->rx) {
 				/* TODO : Need to abstract heap_caps_malloc */
 				uint8_t * copy_payload = (uint8_t *)g_h.funcs->_h_malloc(buf_handle->payload_len);
-				assert(copy_payload);
+				if (!copy_payload) {
+					ESP_LOGW(TAG, "SDIO RX network payload allocation failed; dropping packet");
+					H_FREE_PTR_WITH_FUNC(buf_handle->free_buf_handle, buf_handle->priv_buffer_handle);
+					continue;
+				}
 				assert(buf_handle->payload_len);
 				assert(buf_handle->payload);
 				memcpy(copy_payload, buf_handle->payload, buf_handle->payload_len);
